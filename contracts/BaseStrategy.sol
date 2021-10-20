@@ -5,6 +5,9 @@ pragma experimental ABIEncoderV2;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import {SafeMath} from "@openzeppelin/contracts/math/SafeMath.sol";
+import {StrategySettingsConsts} from "./settings/StrategySettingsConsts.sol";
+import {IStrategySettings} from "./settings/IStrategySettings.sol";
+import {StrategyLib} from "./StrategyLib.sol";
 
 struct StrategyParams {
     uint256 performanceFee;
@@ -176,9 +179,8 @@ interface StrategyAPI {
  *  `harvest()`, and `harvestTrigger()` for further details.
  */
 
-abstract contract BaseStrategy {
+abstract contract BaseStrategy is StrategySettingsConsts {
     using SafeMath for uint256;
-    string public metadataURI;
 
     /**
      * @notice
@@ -221,63 +223,34 @@ abstract contract BaseStrategy {
     }
 
     VaultAPI public vault;
-    address public strategist;
-    address public rewards;
-    address public keeper;
 
     IERC20 public want;
+
+    IStrategySettings public settings;
 
     // So indexers can keep track of this
     event Harvested(uint256 profit, uint256 loss, uint256 debtPayment, uint256 debtOutstanding);
 
-    event UpdatedStrategist(address newStrategist);
-
-    event UpdatedKeeper(address newKeeper);
-
-    event UpdatedRewards(address rewards);
-
-    event UpdatedMinReportDelay(uint256 delay);
-
-    event UpdatedMaxReportDelay(uint256 delay);
-
-    event UpdatedProfitFactor(uint256 profitFactor);
-
-    event UpdatedDebtThreshold(uint256 debtThreshold);
-
     event EmergencyExitEnabled();
-
-    event UpdatedMetadataURI(string metadataURI);
-
-    // The minimum number of seconds between harvest calls. See
-    // `setMinReportDelay()` for more details.
-    uint256 public minReportDelay;
-
-    // The maximum number of seconds between harvest calls. See
-    // `setMaxReportDelay()` for more details.
-    uint256 public maxReportDelay;
-
-    // The minimum multiple that `callCost` must be above the credit/profit to
-    // be "justifiable". See `setProfitFactor()` for more details.
-    uint256 public profitFactor;
-
-    // Use this to adjust the threshold at which running a debt causes a
-    // harvest trigger. See `setDebtThreshold()` for more details.
-    uint256 public debtThreshold;
-
-    // See note on `setEmergencyExit()`.
-    bool public emergencyExit;
-
     // modifiers
+
+    /*
     function _onlyAuthorized() internal {
-        require(msg.sender == strategist || msg.sender == governance());
+        require(settings.isAddressSettingsEqual(STRATEGIST_ADDRESS, msg.sender) || msg.sender == governance());
     }
+    */
 
     function _onlyEmergencyAuthorized() internal {
-        require(msg.sender == strategist || msg.sender == governance() || msg.sender == vault.guardian() || msg.sender == vault.management());
+        require(
+            settings.isAddressSettingsEqual(STRATEGIST_ADDRESS, msg.sender) ||
+            msg.sender == governance() ||
+            msg.sender == vault.guardian() ||
+            msg.sender == vault.management()
+        );
     }
 
     function _onlyStrategist() internal {
-        require(msg.sender == strategist);
+        settings.requireAddressSettingsEqual(STRATEGIST_ADDRESS, msg.sender);
     }
 
     function _onlyGovernance() internal {
@@ -286,16 +259,16 @@ abstract contract BaseStrategy {
 
     function _onlyKeepers() internal {
         require(
-            msg.sender == keeper ||
-                msg.sender == strategist ||
-                msg.sender == governance() ||
-                msg.sender == vault.guardian() ||
-                msg.sender == vault.management()
+            settings.isAddressSettingsEqual(KEEPER_ADDRESS, msg.sender) ||
+            settings.isAddressSettingsEqual(STRATEGIST_ADDRESS, msg.sender) ||
+            msg.sender == governance() ||
+            msg.sender == vault.guardian() ||
+            msg.sender == vault.management()
         );
     }
 
-    constructor(address _vault) public {
-        _initialize(_vault, msg.sender, msg.sender, msg.sender);
+    constructor(address _vault, address _settings) public {
+        _initialize(_vault, _settings);
     }
 
     /**
@@ -304,68 +277,25 @@ abstract contract BaseStrategy {
      *  contract is deployed.
      * @dev `_vault` should implement `VaultAPI`.
      * @param _vault The address of the Vault responsible for this Strategy.
-     * @param _strategist The address to assign as `strategist`.
+     * @param _settings The address to assign as `settings`.
      * The strategist is able to change the reward address
-     * @param _rewards  The address to use for pulling rewards.
-     * @param _keeper The adddress of the _keeper. _keeper
      * can harvest and tend a strategy.
      */
     function _initialize(
         address _vault,
-        address _strategist,
-        address _rewards,
-        address _keeper
+        address _settings
     ) internal {
         require(address(want) == address(0), "Strategy already initialized");
 
         vault = VaultAPI(_vault);
+        settings = IStrategySettings(_settings);
         want = IERC20(vault.token());
-        SafeERC20.safeApprove(want, _vault, uint256(-1)); // Give Vault unlimited access (might save gas)
-        strategist = _strategist;
-        rewards = _rewards;
-        keeper = _keeper;
+        SafeERC20.safeApprove(want, _vault, type(uint256).max); // Give Vault unlimited access (might save gas)
 
         // initialize variables
-        minReportDelay = 0;
-        maxReportDelay = 86400;
-        profitFactor = 100;
-        debtThreshold = 0;
-
-        vault.approve(rewards, uint256(-1)); // Allow rewards to be pulled
-    }
-
-    /**
-     * @notice
-     *  Used to change `strategist`.
-     *
-     *  This may only be called by governance or the existing strategist.
-     * @param _strategist The new address to assign as `strategist`.
-     */
-    function setStrategist(address _strategist) external {
-        _onlyAuthorized();
-        require(_strategist != address(0));
-        strategist = _strategist;
-        emit UpdatedStrategist(_strategist);
-    }
-
-    /**
-     * @notice
-     *  Used to change `keeper`.
-     *
-     *  `keeper` is the only address that may call `tend()` or `harvest()`,
-     *  other than `governance()` or `strategist`. However, unlike
-     *  `governance()` or `strategist`, `keeper` may *only* call `tend()`
-     *  and `harvest()`, and no other authorized functions, following the
-     *  principle of least privilege.
-     *
-     *  This may only be called by governance or the strategist.
-     * @param _keeper The new address to assign as `keeper`.
-     */
-    function setKeeper(address _keeper) external {
-        _onlyAuthorized();
-        require(_keeper != address(0));
-        keeper = _keeper;
-        emit UpdatedKeeper(_keeper);
+        address rewards = settings.getAddressSettingsValue(REWARDS_ADDRESS);
+        require(rewards != address(0x0), "!rewards_set");
+        vault.approve(rewards, type(uint256).max); // Allow rewards to be pulled
     }
 
     /**
@@ -378,96 +308,7 @@ abstract contract BaseStrategy {
      */
     function setRewards(address _rewards) external {
         _onlyStrategist();
-        require(_rewards != address(0));
-        vault.approve(rewards, 0);
-        rewards = _rewards;
-        vault.approve(rewards, uint256(-1));
-        emit UpdatedRewards(_rewards);
-    }
-
-    /**
-     * @notice
-     *  Used to change `minReportDelay`. `minReportDelay` is the minimum number
-     *  of blocks that should pass for `harvest()` to be called.
-     *
-     *  For external keepers (such as the Keep3r network), this is the minimum
-     *  time between jobs to wait. (see `harvestTrigger()`
-     *  for more details.)
-     *
-     *  This may only be called by governance or the strategist.
-     * @param _delay The minimum number of seconds to wait between harvests.
-     */
-    function setMinReportDelay(uint256 _delay) external {
-        _onlyAuthorized();
-        minReportDelay = _delay;
-        emit UpdatedMinReportDelay(_delay);
-    }
-
-    /**
-     * @notice
-     *  Used to change `maxReportDelay`. `maxReportDelay` is the maximum number
-     *  of blocks that should pass for `harvest()` to be called.
-     *
-     *  For external keepers (such as the Keep3r network), this is the maximum
-     *  time between jobs to wait. (see `harvestTrigger()`
-     *  for more details.)
-     *
-     *  This may only be called by governance or the strategist.
-     * @param _delay The maximum number of seconds to wait between harvests.
-     */
-    function setMaxReportDelay(uint256 _delay) external {
-        _onlyAuthorized();
-        maxReportDelay = _delay;
-        emit UpdatedMaxReportDelay(_delay);
-    }
-
-    /**
-     * @notice
-     *  Used to change `profitFactor`. `profitFactor` is used to determine
-     *  if it's worthwhile to harvest, given gas costs. (See `harvestTrigger()`
-     *  for more details.)
-     *
-     *  This may only be called by governance or the strategist.
-     * @param _profitFactor A ratio to multiply anticipated
-     * `harvest()` gas cost against.
-     */
-    function setProfitFactor(uint256 _profitFactor) external {
-        _onlyAuthorized();
-        profitFactor = _profitFactor;
-        emit UpdatedProfitFactor(_profitFactor);
-    }
-
-    /**
-     * @notice
-     *  Sets how far the Strategy can go into loss without a harvest and report
-     *  being required.
-     *
-     *  By default this is 0, meaning any losses would cause a harvest which
-     *  will subsequently report the loss to the Vault for tracking. (See
-     *  `harvestTrigger()` for more details.)
-     *
-     *  This may only be called by governance or the strategist.
-     * @param _debtThreshold How big of a loss this Strategy may carry without
-     * being required to report to the Vault.
-     */
-    function setDebtThreshold(uint256 _debtThreshold) external {
-        _onlyAuthorized();
-        debtThreshold = _debtThreshold;
-        emit UpdatedDebtThreshold(_debtThreshold);
-    }
-
-    /**
-     * @notice
-     *  Used to change `metadataURI`. `metadataURI` is used to store the URI
-     * of the file describing the strategy.
-     *
-     *  This may only be called by governance or the strategist.
-     * @param _metadataURI The URI that describe the strategy.
-     */
-    function setMetadataURI(string calldata _metadataURI) external {
-        _onlyAuthorized();
-        metadataURI = _metadataURI;
-        emit UpdatedMetadataURI(_metadataURI);
+        StrategyLib.internalSetRewards(_rewards, address(this), address(vault), settings);
     }
 
     /**
@@ -671,37 +512,12 @@ abstract contract BaseStrategy {
      */
     function harvestTrigger(uint256 callCostInWei) public view virtual returns (bool) {
         uint256 callCost = ethToWant(callCostInWei);
-        StrategyParams memory params = vault.strategies(address(this));
-
-        // Should not trigger if Strategy is not activated
-        if (params.activation == 0) return false;
-
-        // Should not trigger if we haven't waited long enough since previous harvest
-        if (block.timestamp.sub(params.lastReport) < minReportDelay) return false;
-
-        // Should trigger if hasn't been called in a while
-        if (block.timestamp.sub(params.lastReport) >= maxReportDelay) return true;
-
-        // If some amount is owed, pay it back
-        // NOTE: Since debt is based on deposits, it makes sense to guard against large
-        //       changes to the value from triggering a harvest directly through user
-        //       behavior. This should ensure reasonable resistance to manipulation
-        //       from user-initiated withdrawals as the outstanding debt fluctuates.
-        uint256 outstanding = vault.debtOutstanding();
-        if (outstanding > debtThreshold) return true;
-
-        // Check for profits and losses
-        uint256 total = estimatedTotalAssets();
-        // Trigger if we have a loss to report
-        if (total.add(debtThreshold) < params.totalDebt) return true;
-
-        uint256 profit = 0;
-        if (total > params.totalDebt) profit = total.sub(params.totalDebt); // We've earned a profit!
-
-        // Otherwise, only trigger if it "makes sense" economically (gas cost
-        // is <N% of value moved)
-        uint256 credit = vault.creditAvailable();
-        return (profitFactor.mul(callCost) < credit.add(profit));
+        return StrategyLib.internalHarvestTrigger(
+            address(vault),
+            address(this),
+            callCost,
+            settings
+        );
     }
 
     /**
@@ -723,9 +539,10 @@ abstract contract BaseStrategy {
      */
     function harvest() external {
         _onlyKeepers();
+        bool emergencyExit = settings.getBoolSettingsValue(EMERGENCY_EXIT_BOOL);
+        uint256 debtOutstanding = vault.debtOutstanding();
         uint256 profit = 0;
         uint256 loss = 0;
-        uint256 debtOutstanding = vault.debtOutstanding();
         uint256 debtPayment = 0;
         if (emergencyExit) {
             // Free up as much capital as possible
@@ -748,7 +565,7 @@ abstract contract BaseStrategy {
 
         // Check if free returns are left, and re-invest them
         adjustPosition(debtOutstanding);
-
+        
         emit Harvested(profit, loss, debtPayment, debtOutstanding);
     }
 
@@ -808,7 +625,8 @@ abstract contract BaseStrategy {
      */
     function setEmergencyExit() external {
         _onlyEmergencyAuthorized();
-        emergencyExit = true;
+
+        settings.setSettings(EMERGENCY_EXIT_BOOL, true);
         vault.revokeStrategy();
 
         emit EmergencyExitEnabled();
@@ -867,28 +685,25 @@ abstract contract BaseStrategyInitializable is BaseStrategy {
     bool public isOriginal = true;
     event Cloned(address indexed clone);
 
-    constructor(address _vault) public BaseStrategy(_vault) {}
+    constructor(address _vault, address _settings) public BaseStrategy(_vault, _settings) {}
 
     function initialize(
         address _vault,
-        address _strategist,
-        address _rewards,
-        address _keeper
+        address _settings
     ) external virtual {
-        _initialize(_vault, _strategist, _rewards, _keeper);
+        _initialize(_vault, _settings);
     }
 
-    function clone(address _vault) external returns (address) {
+    function clone(address _vault) public returns (address) {
         require(isOriginal, "!clone");
-        return this.clone(_vault, msg.sender, msg.sender, msg.sender);
+        return clone(_vault, address(settings));
     }
 
     function clone(
         address _vault,
-        address _strategist,
-        address _rewards,
-        address _keeper
-    ) external returns (address newStrategy) {
+        address _settings
+    ) public returns (address newStrategy) {
+        require(isOriginal, "!clone");
         // Copied from https://github.com/optionality/clone-factory/blob/master/contracts/CloneFactory.sol
         bytes20 addressBytes = bytes20(address(this));
 
@@ -901,7 +716,7 @@ abstract contract BaseStrategyInitializable is BaseStrategy {
             newStrategy := create(0, clone_code, 0x37)
         }
 
-        BaseStrategyInitializable(newStrategy).initialize(_vault, _strategist, _rewards, _keeper);
+        BaseStrategyInitializable(newStrategy).initialize(_vault, _settings);
 
         emit Cloned(newStrategy);
     }
